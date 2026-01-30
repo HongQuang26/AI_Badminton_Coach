@@ -1,70 +1,97 @@
-# SourceCode/main_debug.py
 import cv2
 import os
-import time  # Import thêm thư viện thời gian để đo FPS
+import numpy as np
 from src.pose_detector import PoseDetector
+from src.court_mapper import CourtMapper
 
-# CẤU HÌNH ĐƯỜNG DẪN
-VIDEO_PATH = 'data/badminton_test.mp4'
+# Cập nhật đúng tên video TrackNet
+VIDEO_PATH = 'data/tracknet_test.mp4'
 
 
 def main():
     if not os.path.exists(VIDEO_PATH):
-        print(f"LỖI: Không tìm thấy file video tại {VIDEO_PATH}")
+        print(f"Lỗi: Không tìm thấy file {VIDEO_PATH}")
         return
 
-    # Khởi tạo AI
+    # 1. Khởi tạo
+    # Không truyền tham số -> Tự động tải 'yolov8m-pose.pt' (Medium)
     detector = PoseDetector()
+    mapper = CourtMapper()
 
     cap = cv2.VideoCapture(VIDEO_PATH)
 
-    # --- KỸ THUẬT TÍNH FPS ---
-    prev_frame_time = 0
-    new_frame_time = 0
+    # Màu sắc cho P1, P2, P3...
+    PLAYER_COLORS = [(0, 0, 255), (255, 0, 0), (0, 255, 0)]
 
-    print("Bắt đầu xử lý... Nhấn 'q' để thoát.")
+    print("Đang chạy... Nhấn 'q' để thoát.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Hết video.")
+            print("Kết thúc video.")
             break
 
-        # --- BƯỚC QUAN TRỌNG: RESIZE ẢNH ---
-        # Nếu video 4K (3840px) mà đưa vào AI thì rất chậm.
-        # Ta thu nhỏ về chiều ngang 960px (giữ nguyên tỉ lệ khung hình)
-        target_width = 960
+        # --- SỬA LỖI RESIZE (Quan trọng) ---
+        target_width = 1280  # Dùng 1280 để nhìn rõ người ở xa hơn
         height, width = frame.shape[:2]
+        new_height = height  # Khởi tạo giá trị mặc định
 
-        # Chỉ resize nếu video gốc lớn hơn 960px
         if width > target_width:
             scaling_factor = target_width / float(width)
             new_height = int(height * scaling_factor)
             frame = cv2.resize(frame, (target_width, new_height))
 
-        # --- GỌI AI XỬ LÝ (Trên ảnh đã thu nhỏ) ---
+        # --- A. XỬ LÝ AI ---
         results, annotated_frame = detector.process_frame(frame)
 
-        # --- TÍNH FPS (Frame Per Second) ---
-        new_frame_time = time.time()
-        # Công thức: 1 / (thời gian xử lý 1 khung hình)
-        fps = 1 / (new_frame_time - prev_frame_time)
-        prev_frame_time = new_frame_time
+        num_people = 0
+        if results[0].keypoints is not None:
+            num_people = len(results[0].keypoints)
 
-        # Chuyển FPS thành số nguyên (int) và vẽ lên màn hình
-        cv2.putText(annotated_frame, f"FPS: {int(fps)}", (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        # --- B. MINIMAP ---
+        minimap_img = mapper.court_img.copy()
 
-        # --- VẼ CHẤM CỔ CHÂN TRÁI (BÀI TẬP VỀ NHÀ) ---
-        # Index 15 là Cổ chân trái (Left Ankle)
-        left_ankle = detector.get_keypoint_by_index(results, keypoint_index=15)
-        if left_ankle:
-            lx, ly = left_ankle
-            # Vẽ chấm Xanh Lá (0, 255, 0)
-            cv2.circle(annotated_frame, (lx, ly), 10, (0, 255, 0), -1)
+        for i in range(num_people):
+            color = PLAYER_COLORS[i % len(PLAYER_COLORS)]
 
-        # --- HIỂN THỊ ---
-        cv2.imshow('Badminton AI Coach - Debug', annotated_frame)
+            # Lấy toạ độ 2 chân
+            ankle_l = detector.get_keypoint_by_index(results, person_index=i, keypoint_index=15)
+            ankle_r = detector.get_keypoint_by_index(results, person_index=i, keypoint_index=16)
+
+            player_pos_video = None
+            if ankle_l and ankle_r:
+                mid_x = (ankle_l[0] + ankle_r[0]) // 2
+                mid_y = (ankle_l[1] + ankle_r[1]) // 2
+                player_pos_video = (mid_x, mid_y)
+            elif ankle_l:
+                player_pos_video = ankle_l
+            elif ankle_r:
+                player_pos_video = ankle_r
+
+            if player_pos_video:
+                # Vẽ lên video gốc
+                cv2.circle(annotated_frame, player_pos_video, 8, color, -1)
+                cv2.putText(annotated_frame, f"P{i + 1}", (player_pos_video[0], player_pos_video[1] - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Vẽ lên Minimap
+                minimap_point = mapper.convert_to_minimap(player_pos_video)
+                if minimap_point:
+                    mx, my = minimap_point
+                    if 0 <= mx < mapper.map_width and 0 <= my < mapper.map_height:
+                        cv2.circle(minimap_img, (mx, my), 8, color, -1)
+                        cv2.circle(minimap_img, (mx, my), 10, (255, 255, 255), 2)
+                        cv2.putText(minimap_img, f"P{i + 1}", (mx + 10, my),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # --- C. HIỂN THỊ ---
+        # Resize Minimap khớp chiều cao video
+        scale_mini = new_height / minimap_img.shape[0]
+        minimap_resized = cv2.resize(minimap_img, None, fx=scale_mini, fy=scale_mini)
+
+        final_display = np.hstack((annotated_frame, minimap_resized))
+
+        cv2.imshow('Badminton AI Coach (Tracking Mode)', final_display)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
